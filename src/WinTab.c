@@ -553,6 +553,7 @@ static void init_log_context(LPLOGCONTEXTW lctx) {
 //
 
 HCTX WINAPI WTOpenW(HWND hwnd, LPLOGCONTEXTW pLContext, BOOL enable) {
+    log_strf("WTOpenW: called (%s)\n", enable ? "enabled" : "disabled");
     if (!g_didInit)
         load_xwintab();
     if (g_context.handle || !pLContext)
@@ -615,6 +616,7 @@ HCTX WINAPI WTOpenW(HWND hwnd, LPLOGCONTEXTW pLContext, BOOL enable) {
 }
 
 BOOL WINAPI WTClose(HCTX ctx) {
+    log_strf("WTClose: called\n");
     if (!ctx || g_context.handle != ctx)
         return FALSE;
 
