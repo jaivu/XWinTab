@@ -48,6 +48,7 @@ typedef struct ContextTAG {
 } Context;
 
 
+static BOOL g_isLoaded;
 static BOOL g_didInit;
 static Context g_context;
 static DeviceInfo g_deviceInfo;
@@ -454,47 +455,57 @@ static DWORD WINAPI thread_func(void *userdata) {
 //
 
 static BOOL load_xwintab() {
-    InitializeCriticalSection(&g_lock);
+    g_isLoaded = TRUE;
     g_deviceInfo.id = -1;
-    g_didInit = TRUE;
-    g_module = LoadLibraryW(L"XWinTabHelper.dll.so");
+
+    if (!g_didInit) {
+        g_didInit = TRUE;
+        InitializeCriticalSection(&g_lock);
+
+        g_module = LoadLibraryW(L"XWinTabHelper.dll.so");
+        if (!g_module) {
+            log_strf("Failed to load XWinTabHelper.dll.so\n");
+            return FALSE;
+        }
+
+        log_strf("Loaded XWinTabHelper.dll.so\n");
+
+        pLoad = (void*) GetProcAddress(g_module, "Load");
+        pGetSelectedDevice = (void*) GetProcAddress(g_module, "GetSelectedDevice");
+        pBeginEvents = (void*) GetProcAddress(g_module, "BeginEvents");
+        pCheckEvents = (void*) GetProcAddress(g_module, "CheckEvents");
+        pShutdown = (void*) GetProcAddress(g_module, "Shutdown");
+
+        if (!pLoad || !pGetSelectedDevice || !pBeginEvents || !pCheckEvents || !pShutdown) {
+            log_strf("Failed to load helper functions\n");
+            FreeLibrary(g_module);
+            g_module = NULL;
+            return FALSE;
+        }
+
+        log_strf("Loaded helper functions\n");
+    }
+
     if (!g_module) {
-        log_strf("Failed to load XWinTabHelper.dll.so\n");
+        log_strf("Skipping setup due to failed helper load\n");
         return FALSE;
     }
 
-    log_strf("Loaded XWinTabHelper.dll.so\n");
-
-    pLoad = (void*) GetProcAddress(g_module, "Load");
-    pGetSelectedDevice = (void*) GetProcAddress(g_module, "GetSelectedDevice");
-    pBeginEvents = (void*) GetProcAddress(g_module, "BeginEvents");
-    pCheckEvents = (void*) GetProcAddress(g_module, "CheckEvents");
-    pShutdown = (void*) GetProcAddress(g_module, "Shutdown");
-
-    if (pLoad && pGetSelectedDevice && pBeginEvents && pCheckEvents && pShutdown) {
-        log_strf("Loaded funcs\n");
-
-        if (pLoad()) {
-            log_strf("Load() call succeeded\n");
-            DeviceInfo *device = pGetSelectedDevice();
-            if (device) {
-                g_deviceInfo = *device;
-                log_strf("Using device: %d\n", g_deviceInfo.id);
-                return TRUE;
-            }
-            g_deviceInfo.id = -1;
-            log_strf("Couldn't find suitable tablet device\n");
+    if (!pLoad())
+        log_strf("Load() call failed\n");
+    else {
+        DeviceInfo *device = pGetSelectedDevice();
+        if (device) {
+            g_deviceInfo = *device;
+            log_strf("Using device: %d\n", g_deviceInfo.id);
+            return TRUE;
         }
-        else
-            log_strf("Load() call failed\n");
 
-        pShutdown();
+        g_deviceInfo.id = -1;
+        log_strf("Couldn't find suitable tablet device\n");
     }
-    else
-        log_strf("Failed to load funcs\n");
 
-    FreeLibrary(g_module);
-    g_module = NULL;
+    pShutdown();
     return FALSE;
 }
 
@@ -554,7 +565,7 @@ static void init_log_context(LPLOGCONTEXTW lctx) {
 
 HCTX WINAPI WTOpenW(HWND hwnd, LPLOGCONTEXTW pLContext, BOOL enable) {
     log_strf("WTOpenW: called (%s)\n", enable ? "enabled" : "disabled");
-    if (!g_didInit)
+    if (!g_isLoaded)
         load_xwintab();
     if (g_context.handle || !pLContext)
         return NULL;
@@ -629,14 +640,17 @@ BOOL WINAPI WTClose(HCTX ctx) {
         pShutdown();
         g_deviceInfo.id = -1;
         g_context.enabled = FALSE;
+        queue_free(&g_context.queue);
+        g_context.handle = 0;
     }
+    g_isLoaded = FALSE;
     context_message(&g_context, XWT_CTXCLOSE, (WPARAM) g_context.handle,
                     g_context.logContext.lcStatus);
     return TRUE;
 }
 
 UINT WINAPI WTInfoW(UINT cat, UINT idx, LPVOID ptr) {
-    if (!g_didInit)
+    if (!g_isLoaded)
         load_xwintab();
 
     if ((cat == WTI_DEFCONTEXT || cat == WTI_DEFSYSCTX) && !idx) {
