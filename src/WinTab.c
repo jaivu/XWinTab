@@ -621,6 +621,7 @@ BOOL WINAPI WTClose(HCTX ctx) {
     if (g_deviceInfo.id != -1) {
         g_threadStop = TRUE;
         WaitForSingleObject(g_thread, INFINITE);
+        CloseHandle(g_thread);
         g_thread = NULL;
         g_threadStop = FALSE;
         pShutdown();
