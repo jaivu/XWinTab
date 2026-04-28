@@ -105,14 +105,15 @@ static void init_log() {
     }
 
     const WCHAR suffix[] = L"\\XWinTabLog.txt";
+    const size_t suffix_len = sizeof(suffix) / sizeof(WCHAR);
     size_t path_len = wcslen(wbuffer);
 
-    if ((MAX_PATH - sizeof(suffix)) < path_len) {
+    if ((MAX_PATH - suffix_len) < path_len) {
         err_dlg(L"Error opening log file: path length too big.");
         return;
     }
 
-    for (int i = 0; i < sizeof(suffix); i++)
+    for (int i = 0; i < suffix_len; i++)
         wbuffer[path_len + i] = suffix[i];
 
     g_logFile = _wfopen(wbuffer, L"wb");
