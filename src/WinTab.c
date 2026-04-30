@@ -55,6 +55,13 @@ static DeviceInfo g_deviceInfo;
 static BOOL g_PenIsDown = FALSE;
 static HHOOK g_mouseHook = NULL;
 
+// Per-app hook behavior
+typedef enum AppTypeTAG {
+    kAppTypeGeneric  = 0,  // Default: block LBUTTON only, allow MOUSEMOVE
+    kAppTypeSimple   = 1,  // MediBang, FireAlpaca: block MOUSEMOVE + LBUTTON
+} AppType;
+static AppType g_appType = kAppTypeGeneric;
+
 static CRITICAL_SECTION g_lock;
 static HMODULE g_module;
 static HANDLE g_thread;
@@ -352,14 +359,27 @@ static BOOL context_message(Context *ctx, UINT msg, WPARAM wParam,
                                                        return result < 3600 ? result : 0;
                                                    }
 
-                                                   // Hook proc to suppress WM_MOUSEMOVE messages when pen is drawing.
-// Wine's X11 driver forwards core X11 pointer events from the tablet
-// as WM_MOUSEMOVE, causing Krita to see both mouse and pen input
-// simultaneously. This hook drops those mouse moves while pen is down.
+                                                   // Hook proc to suppress mouse events when pen is drawing.
+//
+//  kAppTypeGeneric (Krita etc.)
+//    Block WM_LBUTTONDOWN/UP — Krita uses Wintab for drawing so mouse
+//    button events are the only thing triggering a duplicate stroke.
+//    WM_MOUSEMOVE is allowed so the brush cursor still follows the pen.
+//
+//  kAppTypeSimple (MediBang, FireAlpaca etc.)
+//    No mouse events blocked. These apps use WM_LBUTTONDOWN to trigger
+//    their drawing mode but rely on Wintab packets for actual position
+//    and pressure — WM_MOUSEMOVE only updates the brush indicator cursor,
+//    not the stroke data, so blocking it is unnecessary and causes the
+//    indicator to freeze. The x=0,y=0 button packet fix in on_event()
+//    is sufficient to prevent the cursor jumping to the top-left corner.
 static LRESULT CALLBACK suppress_mouse_hook(int nCode, WPARAM wParam, LPARAM lParam) {
-    if (nCode >= 0 && g_PenIsDown && wParam == WM_MOUSEMOVE) {
-        log_strf("suppress_mouse_hook: pen down, dropping WM_MOUSEMOVE\n");
-        return 1; // non-zero = eat the message, do not pass to Krita
+    if (nCode >= 0 && g_PenIsDown && g_appType == kAppTypeGeneric) {
+        if (wParam == WM_LBUTTONDOWN || wParam == WM_LBUTTONUP ||
+            wParam == WM_LBUTTONDBLCLK) {
+            log_strf("suppress_mouse_hook: generic app, blocking WM_LBUTTON*\n");
+            return 1;
+        }
     }
     return CallNextHookEx(g_mouseHook, nCode, wParam, lParam);
 }
@@ -426,12 +446,33 @@ static void WINAPI on_event(EventInfo *ev) {
                                                        }
 
                                                        const LOGCONTEXTW *lc = &g_context.logContext;
-                                                       pkt->pkX = scale_axis(ev->x, lc->lcInOrgX, lc->lcInExtX, lc->lcOutOrgX,
-                                                                             lc->lcOutExtX);
 
-                                                       LONG fy = lc->lcInExtY - ev->y;
-                                                       pkt->pkY = scale_axis(fy, lc->lcInOrgY, lc->lcInExtY, lc->lcOutOrgY,
-                                                                             lc->lcOutExtY);
+                                                       // Track last known tablet position so button press events
+                                                       // (which arrive with x=0,y=0 from XCB) don't send a
+                                                       // zero-coordinate packet to the app. MediBang/FireAlpaca
+                                                       // interpret x=0,y=0 as "cursor jumped to top-left corner"
+                                                       // which looks like the cursor is frozen/stuck.
+                                                       static LONG g_lastPkX = 0;
+                                                       static LONG g_lastPkY = 0;
+
+                                                       BOOL is_button_event = (ev->type == kEventTypeButtonPress ||
+                                                                               ev->type == kEventTypeButtonRelease);
+
+                                                       if (is_button_event && ev->x == 0 && ev->y == 0) {
+                                                           // Use last known position — button events carry no coords
+                                                           pkt->pkX = g_lastPkX;
+                                                           pkt->pkY = g_lastPkY;
+                                                           log_strf("on_event: button event, using last pos x=%d y=%d\n",
+                                                                    g_lastPkX, g_lastPkY);
+                                                       } else {
+                                                           pkt->pkX = scale_axis(ev->x, lc->lcInOrgX, lc->lcInExtX,
+                                                                                 lc->lcOutOrgX, lc->lcOutExtX);
+                                                           LONG fy = lc->lcInExtY - ev->y;
+                                                           pkt->pkY = scale_axis(fy, lc->lcInOrgY, lc->lcInExtY,
+                                                                                 lc->lcOutOrgY, lc->lcOutExtY);
+                                                           g_lastPkX = pkt->pkX;
+                                                           g_lastPkY = pkt->pkY;
+                                                       }
 
                                                        pkt->pkNormalPressure = ev->pressure;
 
@@ -647,14 +688,33 @@ static void WINAPI on_event(EventInfo *ev) {
                                                        if (g_deviceInfo.id != -1)
                                                            LeaveCriticalSection(&g_lock);
 
-                                                       // Install a thread-local hook on Krita's message thread to drop
-                                                       // WM_MOUSEMOVE events while the pen is in contact with the tablet.
-                                                       // Wine's X11 driver generates these from core X11 pointer events
-                                                       // even though XWinTab is handling the tablet via XInput.
-                                                       DWORD krita_tid = GetWindowThreadProcessId(hwnd, NULL);
-                                                       g_mouseHook = SetWindowsHookExW(WH_MOUSE, suppress_mouse_hook, NULL, krita_tid);
-                                                       log_strf("WTOpenW: Mouse suppress hook %s (tid=%lu)\n",
-                                                                g_mouseHook ? "installed" : "FAILED", krita_tid);
+                                                       // Detect which app we are running under so the hook
+                                                       // can apply the correct suppression strategy.
+                                                       {
+                                                           WCHAR exePath[MAX_PATH] = {0};
+                                                           GetModuleFileNameW(NULL, exePath, MAX_PATH);
+                                                           // Convert to lowercase for comparison
+                                                           WCHAR exeLower[MAX_PATH] = {0};
+                                                           for (int i = 0; i < MAX_PATH && exePath[i]; i++)
+                                                               exeLower[i] = (WCHAR)towlower(exePath[i]);
+
+                                                           if (wcsstr(exeLower, L"medibangpaint") ||
+                                                               wcsstr(exeLower, L"medibang")      ||
+                                                               wcsstr(exeLower, L"firealpaca")) {
+                                                               g_appType = kAppTypeSimple;
+                                                               log_strf("WTOpenW: Detected simple app (MediBang/FireAlpaca), using MOUSEMOVE+LBUTTON suppression\n");
+                                                           } else {
+                                                               g_appType = kAppTypeGeneric;
+                                                               log_strf("WTOpenW: Using generic app mode (LBUTTON suppression only)\n");
+                                                           }
+                                                       }
+
+                                                       // Install a thread-local WH_MOUSE hook to suppress Wine-generated
+                                                       // mouse events while the pen is in contact with the tablet.
+                                                       DWORD app_tid = GetWindowThreadProcessId(hwnd, NULL);
+                                                       g_mouseHook = SetWindowsHookExW(WH_MOUSE, suppress_mouse_hook, NULL, app_tid);
+                                                       log_strf("WTOpenW: Mouse suppress hook %s (tid=%lu, appType=%d)\n",
+                                                                g_mouseHook ? "installed" : "FAILED", app_tid, g_appType);
 
                                                        return g_context.handle;
                                                    }
