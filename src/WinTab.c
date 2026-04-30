@@ -54,6 +54,7 @@ static Context g_context;
 static DeviceInfo g_deviceInfo;
 static BOOL g_PenIsDown = FALSE;
 static HHOOK g_mouseHook = NULL;
+static HHOOK g_kbHook = NULL;
 
 // Per-app hook behavior
 typedef enum AppTypeTAG {
@@ -61,6 +62,10 @@ typedef enum AppTypeTAG {
     kAppTypeSimple   = 1,  // MediBang, FireAlpaca: block MOUSEMOVE + LBUTTON
 } AppType;
 static AppType g_appType = kAppTypeGeneric;
+
+// When TRUE, pen behaves as mouse in Krita (LBUTTON suppression disabled).
+// Toggled by pressing the lower barrel button on the stylus.
+static BOOL g_mouseModeOverride = FALSE;
 
 static CRITICAL_SECTION g_lock;
 static HMODULE g_module;
@@ -360,31 +365,64 @@ static BOOL context_message(Context *ctx, UINT msg, WPARAM wParam,
                                                    }
 
                                                    // Hook proc to suppress mouse events when pen is drawing.
-//
-//  kAppTypeGeneric (Krita etc.)
-//    Block WM_LBUTTONDOWN/UP — Krita uses Wintab for drawing so mouse
-//    button events are the only thing triggering a duplicate stroke.
-//    WM_MOUSEMOVE is allowed so the brush cursor still follows the pen.
-//
-//  kAppTypeSimple (MediBang, FireAlpaca etc.)
-//    No mouse events blocked. These apps use WM_LBUTTONDOWN to trigger
-//    their drawing mode but rely on Wintab packets for actual position
-//    and pressure — WM_MOUSEMOVE only updates the brush indicator cursor,
-//    not the stroke data, so blocking it is unnecessary and causes the
-//    indicator to freeze. The x=0,y=0 button packet fix in on_event()
-//    is sufficient to prevent the cursor jumping to the top-left corner.
-static LRESULT CALLBACK suppress_mouse_hook(int nCode, WPARAM wParam, LPARAM lParam) {
-    if (nCode >= 0 && g_PenIsDown && g_appType == kAppTypeGeneric) {
-        if (wParam == WM_LBUTTONDOWN || wParam == WM_LBUTTONUP ||
-            wParam == WM_LBUTTONDBLCLK) {
-            log_strf("suppress_mouse_hook: generic app, blocking WM_LBUTTON*\n");
-            return 1;
-        }
-    }
-    return CallNextHookEx(g_mouseHook, nCode, wParam, lParam);
-}
+                                                    //
+                                                    //  kAppTypeGeneric (Krita etc.)
+                                                    //    Block WM_LBUTTONDOWN/UP — Krita uses Wintab for drawing so mouse
+                                                    //    button events are the only thing triggering a duplicate stroke.
+                                                    //    WM_MOUSEMOVE is allowed so the brush cursor still follows the pen.
+                                                    //
+                                                    //  kAppTypeSimple (MediBang, FireAlpaca etc.)
+                                                    //    No mouse events blocked. These apps use WM_LBUTTONDOWN to trigger
+                                                    //    their drawing mode but rely on Wintab packets for actual position
+                                                    //    and pressure — WM_MOUSEMOVE only updates the brush indicator cursor,
+                                                    //    not the stroke data, so blocking it is unnecessary and causes the
+                                                    //    indicator to freeze. The x=0,y=0 button packet fix in on_event()
+                                                    //    is sufficient to prevent the cursor jumping to the top-left corner.
+                                                    static LRESULT CALLBACK suppress_mouse_hook(int nCode, WPARAM wParam, LPARAM lParam) {
+                                                        if (nCode >= 0 && g_appType == kAppTypeGeneric) {
+                                                            // Lower barrel button = Right click (OTD mapping).
+                                                            // Toggle mouse mode on press so pen can interact with Krita UI.
+                                                            if (wParam == WM_RBUTTONDOWN) {
+                                                                g_mouseModeOverride = !g_mouseModeOverride;
+                                                                log_strf("suppress_mouse_hook: lower barrel → mouse mode %s\n",
+                                                                        g_mouseModeOverride ? "ON" : "OFF");
+                                                                // Don't block the right-click itself — let Krita see it
+                                                            }
 
-static void WINAPI on_event(EventInfo *ev) {
+                                                            // Block LBUTTON while pen is drawing and mouse mode is OFF.
+                                                            // This prevents Wine's X11 driver from triggering a duplicate
+                                                            // mouse stroke on top of the Wintab stroke.
+                                                            if (g_PenIsDown && !g_mouseModeOverride) {
+                                                                if (wParam == WM_LBUTTONDOWN || wParam == WM_LBUTTONUP ||
+                                                                    wParam == WM_LBUTTONDBLCLK) {
+                                                                    log_strf("suppress_mouse_hook: blocking WM_LBUTTON* (draw mode)\n");
+                                                                    return 1;
+                                                                }
+                                                            }
+                                                        }
+                                                        return CallNextHookEx(g_mouseHook, nCode, wParam, lParam);
+                                                    }
+
+                                                    // Low-level keyboard hook to detect the barrel button toggle shortcut.
+                                                    // OTD maps the lower barrel button to PageDown (VK_NEXT = 0x22).
+                                                    // WH_KEYBOARD_LL is system-wide so it catches OTD-injected key events
+                                                    // regardless of which thread they arrive on — unlike WH_MOUSE which is
+                                                    // thread-local and misses OTD barrel button events.
+                                                    static LRESULT CALLBACK kb_hook(int nCode, WPARAM wParam, LPARAM lParam) {
+                                                        if (nCode >= 0 && wParam == WM_KEYDOWN) {
+                                                            KBDLLHOOKSTRUCT *kb = (KBDLLHOOKSTRUCT *) lParam;
+                                                            // Toggle on PageDown (lower barrel button via OTD)
+                                                            if (kb->vkCode == VK_NEXT) {
+                                                                g_mouseModeOverride = !g_mouseModeOverride;
+                                                                log_strf("kb_hook: PageDown (barrel) → mouse mode %s\n",
+                                                                        g_mouseModeOverride ? "ON" : "OFF");
+                                                                return 1; // eat the keystroke, don't pass to Krita
+                                                            }
+                                                        }
+                                                        return CallNextHookEx(g_kbHook, nCode, wParam, lParam);
+                                                    }
+
+                                                    static void WINAPI on_event(EventInfo *ev) {
                                                        static UINT serial = 0;
 
                                                        EnterCriticalSection(&g_lock);
@@ -716,6 +754,16 @@ static void WINAPI on_event(EventInfo *ev) {
                                                        log_strf("WTOpenW: Mouse suppress hook %s (tid=%lu, appType=%d)\n",
                                                                 g_mouseHook ? "installed" : "FAILED", app_tid, g_appType);
 
+                                                       // Install a system-wide low-level keyboard hook to detect the
+                                                       // barrel button toggle (Ctrl+Alt+M). WH_KEYBOARD_LL catches
+                                                       // OTD-injected key events regardless of thread — unlike WH_MOUSE.
+                                                       // Only installed for Krita (generic app type).
+                                                       if (g_appType == kAppTypeGeneric) {
+                                                           g_kbHook = SetWindowsHookExW(WH_KEYBOARD_LL, kb_hook, NULL, 0);
+                                                           log_strf("WTOpenW: Keyboard hook %s\n",
+                                                                    g_kbHook ? "installed" : "FAILED");
+                                                       }
+
                                                        return g_context.handle;
                                                    }
 
@@ -730,6 +778,11 @@ static void WINAPI on_event(EventInfo *ev) {
                                                                UnhookWindowsHookEx(g_mouseHook);
                                                                g_mouseHook = NULL;
                                                                log_strf("WTClose: Mouse hook removed\n");
+                                                           }
+                                                           if (g_kbHook) {
+                                                               UnhookWindowsHookEx(g_kbHook);
+                                                               g_kbHook = NULL;
+                                                               log_strf("WTClose: Keyboard hook removed\n");
                                                            }
                                                            g_threadStop = TRUE;
                                                            WaitForSingleObject(g_thread, INFINITE);
